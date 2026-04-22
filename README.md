@@ -1,14 +1,237 @@
-# astrbot-plugin-helloworld
+# astrbot_plugin_echo_cave
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+AstrBot 回声洞插件。支持 `.cave` 参数命令形式：默认随机听回声，`.cave -a` 投稿，`.cave -g 编号` 查看指定回声，`.cave -h` 帮助。发送投稿指令后还可以在 60 秒内继续投稿；如果回复了别人的消息投稿，被回复的那条消息也会一起收入回声洞。机器人可以随机回放历史投稿；管理员可以查看最近投稿并删除指定编号。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 功能
 
-# Supports
+- `.cave` 默认随机听回声
+- `.cave -a` 投稿，支持纯文本、纯图片、图文混合
+- `.cave -a` 无附带内容时，会进入 60 秒投稿模式
+- `.cave -g 编号` 查看指定编号的完整回声内容
+- `.cave -h` 查看帮助
+- `.cave -l` 查看当前用户自己的投稿
+- `.cave -d 编号` 删除指定投稿（管理员）
+- `.cave --all` 查看最近 20 条全局投稿（管理员）
+- 投稿时如果回复了别人的消息，会把那条消息一起加入投稿
+- 插件设置支持配置“额外管理员账号列表”
+- 兼容旧命令：`.cavepost`、`.cavehelp`、`.cavelist`、`.cavedel`、`/回声洞`、`/听回声`、`/删除回声 编号`、`/回声洞帮助`
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 数据存储
+
+- 插件数据保存在插件目录下的 `echo_cave_data.json`
+- 数据结构为：
+
+```json
+{
+  "next_id": 1,
+  "entries": [
+    {
+      "id": 1,
+      "type": "mixed",
+      "text": "今天路过海边，风很大。",
+      "images": [
+        {
+          "segment_type": "image",
+          "segment_data": {
+            "url": "https://example.com/demo.jpg"
+          },
+          "url": "https://example.com/demo.jpg",
+          "resend": {
+            "type": "url",
+            "value": "https://example.com/demo.jpg"
+          }
+        }
+      ],
+      "quote": {
+        "text": "上一条被回复的内容",
+        "images": [],
+        "message_id": "123456"
+      },
+      "created_at": "2026-04-20 22:00:00 +0800",
+      "submitter": {
+        "lookup_key": "b7b13a...查询哈希",
+        "name": "SCmenghua",
+        "masked_id": "205***572",
+        "display": "SCmenghua--205***572"
+      }
+    }
+  ]
+}
+```
+
+- `type` 固定为 `text`、`image`、`mixed`
+- `text` 保存文本内容
+- `images` 保存图片消息段的可序列化字段，并优先记录可直接重发的 URL 或文件路径
+- `quote` 保存被回复消息中纳入投稿的文本和图片
+- `created_at` 保存投稿时间
+- `submitter` 保存脱敏署名信息
+- 其中 `lookup_key` 是不可逆哈希，用于 `.cavelist` 只查询当前用户自己的投稿
+- `.cave` 对外只显示 `display`，例如 `SCmenghua--205***572`
+
+## 命令说明
+
+### 1. 投稿
+
+发送：
+
+```text
+.cave -a 今天心情很好
+```
+
+或：
+
+```text
+.cave -a
+```
+
+如果这条指令本身没有附带内容，插件会进入 60 秒投稿模式。你可以在 60 秒内继续发送：
+
+- 纯文本
+- 纯图片
+- 图文混合
+- 回复别人的消息进行投稿
+
+发送 `取消` 可以退出本次投稿模式。
+
+### 2. 随机听回声
+
+```text
+.cave
+```
+
+机器人会随机读取一条历史投稿，并自动按投稿类型发送文本和图片。
+
+回显格式会尽量接近你给的示意图：
+
+```text
+回声洞 —— (编号)
+
+回复：
+被引用的消息内容
+
+投稿文本
+—— SCmenghua--205***572
+```
+
+如果是图文或纯图片投稿，会在同一条消息里继续附带图片；如果投稿时回复了别人，被回复消息里的文本和图片也会一起显示。
+
+### 3. 查看本人投稿列表
+
+```text
+.cave -l
+```
+
+显示当前用户最近的投稿，包含：
+
+- 编号
+- 投稿类型
+- 文本摘要
+- 图片数量
+- 投稿时间
+
+不会显示其他人的投稿。
+
+### 4. 按编号查看回声
+
+```text
+.cave -g 12
+```
+
+查看编号为 `12` 的完整回声内容。
+
+### 5. 管理员查看全局列表
+
+```text
+.cave --all
+```
+
+显示最近 20 条全局投稿。
+
+### 6. 管理员删除投稿
+
+```text
+.cave -d 12
+```
+
+删除编号为 `12` 的投稿。
+
+### 7. 插件设置添加管理员
+
+在 AstrBot 插件设置中找到回声洞插件，填写 `管理员账号列表`。
+
+支持以下分隔方式：
+
+- 换行
+- 空格
+- 英文逗号 `,`
+- 英文分号 `;`
+
+例如：
+
+```text
+123456789
+987654321
+```
+
+或：
+
+```text
+123456789,987654321
+```
+
+配置后的账号可以使用：
+
+- `/回声洞列表`
+- `.cavedel 编号`
+
+### 8. 帮助
+
+```text
+.cave -h
+```
+
+## 实现说明
+
+- 使用 AstrBot `event.get_messages()` 解析消息链
+- 识别文本消息段和图片消息段
+- 使用 `.cave` 统一入口解析 `-a/-g/-h/-l/-d/--all` 参数
+- 使用 AstrBot `session_waiter` 实现投稿指令后的 60 秒投稿模式
+- 回复消息投稿时，会优先尝试解析被回复消息，并把其中的文本和图片纳入投稿
+- 投稿时会生成脱敏署名：昵称 + 脱敏 ID + 不可逆查询哈希
+- 插件配置通过 `_conf_schema.json` 提供额外管理员账号列表
+- 图片保存时优先保留可直接重发的信息：图片 URL、本地文件路径，以及消息段可序列化字段
+- 回放时优先尝试 `Comp.Image.fromURL(...)` 和 `Comp.Image.fromFileSystem(...)`
+- `.cavelist` 通过查询哈希只查询当前发送者自己的投稿
+- `.cave -g 编号` 可直接查看指定编号的完整回声内容
+- 管理员权限支持插件设置中的额外管理员，且会尽量兼容平台事件中的管理员/群主标记
+- JSON 写入采用临时文件替换，降低数据损坏风险
+- 当 JSON 文件损坏时，会自动备份损坏文件并重建空数据
+- 仅使用 Python 标准库，不依赖外部包
+
+## 目录结构
+
+```text
+astrbot_plugin_echo_cave/
+├── _conf_schema.json
+├── main.py
+├── metadata.yaml
+├── README.md
+└── echo_cave_data.json   # 运行后自动生成
+```
+
+## 兼容性说明
+
+- 插件按照 AstrBot 标准插件结构编写
+- 管理员命令 `/回声洞列表` 与 `.cavedel` 通过插件设置中的额外管理员列表和常见平台管理员标记共同校验
+- `.cave -a` 既支持直接附带内容投稿，也支持先发指令再在 60 秒内补发内容
+- 如果历史投稿中的图片 URL 或文件路径失效，插件会尽量发送其余内容，并提示有图片无法恢复
+- 历史旧数据如果没有 `submitter` 字段，将不会出现在新的 `.cavelist` 个人查询结果中
+
+## 开发者说明
+
+核心代码位于：
+
+- `main.py`
+- `metadata.yaml`
+
+如需发布插件，请自行补充 `metadata.yaml` 中的 `repo` 信息。

@@ -201,6 +201,11 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Plugin runtime data
+echo_cave_data.json
+echo_cave_data.json.tmp
+echo_cave_data.broken.*.json
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
