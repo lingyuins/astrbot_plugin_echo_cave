@@ -1,6 +1,6 @@
 name: astrbot_plugin_echo_cave
 display_name: 回声洞
 desc: 支持 cave 命令参数模式、按编号查看、60 秒投稿模式、引用回复投稿，以及文本图片回放的回声洞插件。
-version: v1.4.0
+version: v1.4.1
 author: Lingyu
 repo: ""

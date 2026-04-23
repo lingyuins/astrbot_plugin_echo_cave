@@ -19,6 +19,7 @@ AstrBot 回声洞插件。支持 `.cave` 参数命令形式：默认随机听回
 ## 数据存储
 
 - 插件数据保存在插件目录下的 `echo_cave_data.json`
+- 投稿时会尽量把图片缓存到插件目录下的 `echo_cave_media/`，避免 QQ NT 临时图片链接过期后无法回放
 - 数据结构为：
 
 ```json
@@ -35,10 +36,11 @@ AstrBot 回声洞插件。支持 `.cave` 参数命令形式：默认随机听回
           "segment_data": {
             "url": "https://example.com/demo.jpg"
           },
+          "cached_path": "echo_cave_media/8d6f8d1c0fdc0e17d9c2a4e1a1d4d3a1.jpg",
           "url": "https://example.com/demo.jpg",
           "resend": {
-            "type": "url",
-            "value": "https://example.com/demo.jpg"
+            "type": "file",
+            "value": "echo_cave_media/8d6f8d1c0fdc0e17d9c2a4e1a1d4d3a1.jpg"
           }
         }
       ],
@@ -61,7 +63,7 @@ AstrBot 回声洞插件。支持 `.cave` 参数命令形式：默认随机听回
 
 - `type` 固定为 `text`、`image`、`mixed`
 - `text` 保存文本内容
-- `images` 保存图片消息段的可序列化字段，并优先记录可直接重发的 URL 或文件路径
+- `images` 保存图片消息段的可序列化字段，并优先记录本地缓存路径；缓存失败时保留原始 URL 或文件路径
 - `quote` 保存被回复消息中纳入投稿的文本和图片
 - `created_at` 保存投稿时间
 - `submitter` 保存脱敏署名信息
@@ -199,8 +201,8 @@ AstrBot 回声洞插件。支持 `.cave` 参数命令形式：默认随机听回
 - 回复消息投稿时，会优先尝试解析被回复消息，并把其中的文本和图片纳入投稿
 - 投稿时会生成脱敏署名：昵称 + 脱敏 ID + 不可逆查询哈希
 - 插件配置通过 `_conf_schema.json` 提供额外管理员账号列表
-- 图片保存时优先保留可直接重发的信息：图片 URL、本地文件路径，以及消息段可序列化字段
-- 回放时优先尝试 `Comp.Image.fromURL(...)` 和 `Comp.Image.fromFileSystem(...)`
+- 图片保存时会优先把可访问的图片缓存到 `echo_cave_media/`，并保留原始 URL、本地文件路径与消息段可序列化字段作为兜底
+- 回放时优先尝试本地缓存图片，其次回退到原始 URL
 - `.cavelist` 通过查询哈希只查询当前发送者自己的投稿
 - `.cave -g 编号` 可直接查看指定编号的完整回声内容
 - 管理员权限支持插件设置中的额外管理员，且会尽量兼容平台事件中的管理员/群主标记
@@ -213,6 +215,7 @@ AstrBot 回声洞插件。支持 `.cave` 参数命令形式：默认随机听回
 ```text
 astrbot_plugin_echo_cave/
 ├── _conf_schema.json
+├── echo_cave_media/      # 运行后自动生成，缓存投稿图片
 ├── main.py
 ├── metadata.yaml
 ├── README.md
@@ -224,6 +227,7 @@ astrbot_plugin_echo_cave/
 - 插件按照 AstrBot 标准插件结构编写
 - 管理员命令 `/回声洞列表` 与 `.cavedel` 通过插件设置中的额外管理员列表和常见平台管理员标记共同校验
 - `.cave -a` 既支持直接附带内容投稿，也支持先发指令再在 60 秒内补发内容
+- 新投稿会尽量缓存图片，减少 QQ NT 临时下载链接失效导致的回放失败
 - 如果历史投稿中的图片 URL 或文件路径失效，插件会尽量发送其余内容，并提示有图片无法恢复
 - 历史旧数据如果没有 `submitter` 字段，将不会出现在新的 `.cavelist` 个人查询结果中
 

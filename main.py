@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import mimetypes
 import random
 import re
 import shutil
@@ -10,6 +11,8 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
@@ -18,11 +21,13 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
 PLUGIN_NAME = "astrbot_plugin_echo_cave"
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 DATA_FILE_NAME = "echo_cave_data.json"
+MEDIA_DIR_NAME = "echo_cave_media"
 LIST_LIMIT = 20
 SUMMARY_LIMIT = 24
 SUBMIT_TIMEOUT_SECONDS = 60
+REMOTE_IMAGE_TIMEOUT_SECONDS = 15
 ADMIN_ROLE_KEYWORDS = {"admin", "administrator", "owner", "superadmin", "super_admin"}
 CANCEL_SUBMIT_WORDS = {"取消", "退出", "cancel", "quit", "exit"}
 
@@ -33,12 +38,14 @@ class EchoCavePlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self._data_path = Path(__file__).resolve().parent / DATA_FILE_NAME
+        self._media_dir = self._data_path.parent / MEDIA_DIR_NAME
         self._lock = asyncio.Lock()
 
     async def initialize(self):
         """插件初始化时确保数据文件存在。"""
         try:
             async with self._lock:
+                self._ensure_storage_dirs()
                 store = self._read_store_unlocked()
                 self._write_store_unlocked(store)
         except Exception:
@@ -329,7 +336,8 @@ class EchoCavePlugin(Star):
         await cave_submit_waiter(event)
 
     async def _save_submission_result(self, event: AstrMessageEvent, submission: dict[str, Any]):
-        entry_id = await self._append_entry(submission)
+        persisted_submission = await self._materialize_submission_media(submission)
+        entry_id = await self._append_entry(persisted_submission)
         return event.plain_result(f"投稿已收录，编号 #{entry_id}。")
 
     def _parse_cave_cli(self, event: AstrMessageEvent) -> dict[str, str]:
@@ -413,6 +421,271 @@ class EchoCavePlugin(Star):
             if not entries:
                 return None
             return deepcopy(random.choice(entries))
+
+    async def _materialize_submission_media(self, submission: dict[str, Any]) -> dict[str, Any]:
+        persisted = deepcopy(submission)
+        persisted["images"] = await self._cache_images(persisted.get("images"))
+
+        quote = self._normalize_quote(persisted.get("quote"))
+        if quote:
+            normalized_quote = deepcopy(quote)
+            normalized_quote["images"] = await self._cache_images(normalized_quote.get("images"))
+            persisted["quote"] = normalized_quote
+
+        return persisted
+
+    async def _cache_images(self, images: Any) -> list[dict[str, Any]]:
+        normalized_images = self._normalize_images(images)
+        if not normalized_images:
+            return []
+
+        cached_images: list[dict[str, Any]] = []
+        for image_info in normalized_images:
+            cached_images.append(await asyncio.to_thread(self._cache_single_image, image_info))
+        return cached_images
+
+    def _cache_single_image(self, image_info: dict[str, Any]) -> dict[str, Any]:
+        cached_info = deepcopy(image_info)
+
+        local_path = self._extract_existing_local_image_path(cached_info)
+        if local_path is not None:
+            cached_path = self._copy_image_to_cache(local_path)
+            if cached_path:
+                cached_info["cached_path"] = cached_path
+                cached_info["resend"] = {"type": "file", "value": cached_path}
+                return cached_info
+
+        source_url = self._extract_remote_image_url(cached_info)
+        if source_url:
+            cached_info.setdefault("url", source_url)
+            cached_path = self._download_image_to_cache(source_url)
+            if cached_path:
+                cached_info["cached_path"] = cached_path
+                cached_info["resend"] = {"type": "file", "value": cached_path}
+
+        return cached_info
+
+    def _extract_existing_local_image_path(self, image_info: dict[str, Any]) -> Path | None:
+        resend = image_info.get("resend")
+        candidates = [
+            image_info.get("cached_path"),
+            image_info.get("file_path"),
+            image_info.get("file"),
+            image_info.get("path"),
+        ]
+        if isinstance(resend, dict) and str(resend.get("type", "")).lower() == "file":
+            candidates.insert(0, resend.get("value"))
+
+        segment_data = image_info.get("segment_data")
+        if isinstance(segment_data, dict):
+            candidates.extend(
+                [
+                    segment_data.get("cached_path"),
+                    segment_data.get("file"),
+                    segment_data.get("path"),
+                    segment_data.get("file_path"),
+                    segment_data.get("filepath"),
+                ]
+            )
+
+        for candidate in candidates:
+            resolved = self._resolve_local_file_path(candidate)
+            if resolved is not None and resolved.exists():
+                return resolved
+        return None
+
+    def _extract_remote_image_url(self, image_info: dict[str, Any]) -> str | None:
+        resend = image_info.get("resend")
+        candidates = [
+            image_info.get("url"),
+            image_info.get("image_url"),
+            image_info.get("file_path"),
+            image_info.get("file"),
+            image_info.get("path"),
+        ]
+
+        if isinstance(resend, dict):
+            resend_value = resend.get("value")
+            if str(resend.get("type", "")).lower() == "url":
+                candidates.insert(0, resend_value)
+            else:
+                candidates.append(resend_value)
+
+        segment_data = image_info.get("segment_data")
+        if isinstance(segment_data, dict):
+            candidates.extend(
+                [
+                    segment_data.get("url"),
+                    segment_data.get("image_url"),
+                    segment_data.get("src"),
+                    segment_data.get("file"),
+                    segment_data.get("path"),
+                    segment_data.get("file_path"),
+                    segment_data.get("filepath"),
+                ]
+            )
+
+        for candidate in candidates:
+            normalized = self._normalize_http_url(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    def _resolve_local_file_path(self, value: Any) -> Path | None:
+        if not isinstance(value, str):
+            return None
+
+        raw_value = value.strip()
+        if not raw_value or self._normalize_http_url(raw_value):
+            return None
+        if raw_value.lower().startswith("base64://"):
+            return None
+
+        parsed = urlparse(raw_value)
+        if parsed.scheme == "file":
+            raw_value = parsed.path or ""
+            if re.match(r"^/[A-Za-z]:/", raw_value):
+                raw_value = raw_value[1:]
+
+        if not raw_value:
+            return None
+
+        candidate = Path(raw_value)
+        if not candidate.is_absolute():
+            candidate = (self._data_path.parent / candidate).resolve()
+        return candidate
+
+    def _copy_image_to_cache(self, source_path: Path) -> str | None:
+        try:
+            resolved_source = source_path.resolve()
+        except OSError:
+            resolved_source = source_path
+
+        existing_cached = self._as_cached_media_path(resolved_source)
+        if existing_cached:
+            return existing_cached
+
+        try:
+            image_bytes = resolved_source.read_bytes()
+        except OSError:
+            logger.warning(f"读取图片缓存源文件失败：{resolved_source}")
+            return None
+
+        return self._store_cached_image_bytes(
+            image_bytes,
+            source_hint=resolved_source.name,
+        )
+
+    def _download_image_to_cache(self, source_url: str) -> str | None:
+        request = Request(
+            source_url,
+            headers={
+                "User-Agent": f"{PLUGIN_NAME}/{PLUGIN_VERSION}",
+                "Accept": "image/*,*/*;q=0.8",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=REMOTE_IMAGE_TIMEOUT_SECONDS) as response:
+                content_type = response.headers.get("Content-Type", "")
+                image_bytes = response.read()
+        except Exception as exc:
+            logger.warning(f"缓存远程图片失败：{type(exc).__name__}: {exc}")
+            return None
+
+        if not image_bytes:
+            return None
+
+        return self._store_cached_image_bytes(
+            image_bytes,
+            source_hint=source_url,
+            content_type=content_type,
+        )
+
+    def _store_cached_image_bytes(
+        self,
+        image_bytes: bytes,
+        source_hint: str = "",
+        content_type: str = "",
+    ) -> str | None:
+        if not image_bytes:
+            return None
+
+        self._ensure_storage_dirs()
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        suffix = self._guess_image_suffix(source_hint, content_type, image_bytes)
+        target_path = self._media_dir / f"{digest}{suffix}"
+
+        if not target_path.exists():
+            temp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
+            try:
+                temp_path.write_bytes(image_bytes)
+                temp_path.replace(target_path)
+            except OSError:
+                logger.warning(f"写入图片缓存失败：{target_path}")
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                except OSError:
+                    pass
+                return None
+
+        return self._as_cached_media_path(target_path)
+
+    def _guess_image_suffix(self, source_hint: str, content_type: str, image_bytes: bytes) -> str:
+        mime_type = str(content_type or "").split(";", 1)[0].strip().lower()
+        if mime_type.startswith("image/"):
+            suffix = mimetypes.guess_extension(mime_type)
+            normalized = self._normalize_image_suffix(suffix)
+            if normalized:
+                return normalized
+
+        parsed = urlparse(str(source_hint or ""))
+        suffix = self._normalize_image_suffix(Path(parsed.path).suffix or Path(str(source_hint)).suffix)
+        if suffix:
+            return suffix
+
+        if image_bytes.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+            return ".gif"
+        if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+            return ".webp"
+        if image_bytes.startswith(b"BM"):
+            return ".bmp"
+
+        return ".img"
+
+    def _normalize_image_suffix(self, suffix: str | None) -> str | None:
+        if not suffix:
+            return None
+
+        normalized = suffix.lower()
+        mapping = {
+            ".jpe": ".jpg",
+            ".jpeg": ".jpg",
+            ".svgz": ".svg",
+            ".tif": ".tiff",
+        }
+        normalized = mapping.get(normalized, normalized)
+        if re.fullmatch(r"\.[a-z0-9]{1,8}", normalized):
+            return normalized
+        return None
+
+    def _as_cached_media_path(self, path: Path) -> str | None:
+        try:
+            resolved_path = path.resolve()
+            resolved_path.relative_to(self._media_dir.resolve())
+            relative_path = resolved_path.relative_to(self._data_path.parent.resolve())
+        except ValueError:
+            return None
+        return relative_path.as_posix()
+
+    def _ensure_storage_dirs(self) -> None:
+        self._data_path.parent.mkdir(parents=True, exist_ok=True)
+        self._media_dir.mkdir(parents=True, exist_ok=True)
 
     async def _get_recent_entries(self, limit: int) -> list[dict[str, Any]]:
         async with self._lock:
@@ -750,46 +1023,25 @@ class EchoCavePlugin(Star):
         return chain, failed_images
 
     def _build_image_component(self, image_info: dict[str, Any]) -> Any | None:
-        resend = image_info.get("resend")
-        if isinstance(resend, dict):
-            resend_type = str(resend.get("type", "")).lower()
-            resend_value = resend.get("value")
-            if resend_type == "url" and isinstance(resend_value, str) and resend_value:
-                return Comp.Image.fromURL(resend_value)
-            if resend_type == "file" and isinstance(resend_value, str) and resend_value:
-                return Comp.Image.fromFileSystem(resend_value)
+        local_path = self._extract_existing_local_image_path(image_info)
+        if local_path is not None:
+            return Comp.Image.fromFileSystem(str(local_path))
 
-        url = self._first_string(
-            image_info.get("url"),
-            image_info.get("image_url"),
-            self._extract_string_from_mapping(image_info.get("segment_data"), ("url", "image_url", "src")),
-        )
+        url = self._extract_remote_image_url(image_info)
         if url:
             return Comp.Image.fromURL(url)
-
-        file_path = self._first_string(
-            image_info.get("file_path"),
-            image_info.get("file"),
-            image_info.get("path"),
-            self._extract_string_from_mapping(
-                image_info.get("segment_data"),
-                ("file", "path", "file_path", "filepath"),
-            ),
-        )
-        if file_path:
-            return Comp.Image.fromFileSystem(file_path)
 
         return None
 
     def _serialize_image_segment(self, segment: Any) -> dict[str, Any] | None:
         raw_payload = self._extract_segment_payload(segment)
         serializable_payload = self._to_serializable(raw_payload)
-        url = self._first_string(
+        raw_url = self._first_string(
             getattr(segment, "url", None),
             getattr(segment, "image_url", None),
             self._extract_string_from_mapping(serializable_payload, ("url", "image_url", "src")),
         )
-        file_path = self._first_string(
+        raw_file_path = self._first_string(
             getattr(segment, "file", None),
             getattr(segment, "path", None),
             getattr(segment, "file_path", None),
@@ -798,6 +1050,11 @@ class EchoCavePlugin(Star):
                 ("file", "path", "file_path", "filepath"),
             ),
         )
+        url = self._normalize_http_url(raw_url)
+        if url is None:
+            url = self._normalize_http_url(raw_file_path)
+
+        file_path = None if self._normalize_http_url(raw_file_path) else raw_file_path
 
         image_info: dict[str, Any] = {
             "segment_type": self._segment_type_name(segment),
@@ -858,7 +1115,7 @@ class EchoCavePlugin(Star):
         return {"next_id": next_id, "entries": normalized_entries}
 
     def _write_store_unlocked(self, store: dict[str, Any]) -> None:
-        self._data_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_storage_dirs()
         temp_path = self._data_path.with_name(f"{self._data_path.name}.tmp")
         payload = json.dumps(store, ensure_ascii=False, indent=2)
         temp_path.write_text(payload, encoding="utf-8")
@@ -1073,6 +1330,15 @@ class EchoCavePlugin(Star):
         for value in values:
             if isinstance(value, str) and value:
                 return value
+        return None
+
+    def _normalize_http_url(self, value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+
+        normalized = value.strip()
+        if normalized.lower().startswith(("http://", "https://")):
+            return normalized
         return None
 
     def _is_plain_component(self, component: Any) -> bool:
