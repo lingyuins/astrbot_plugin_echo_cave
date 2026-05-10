@@ -21,7 +21,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
 PLUGIN_NAME = "astrbot_plugin_echo_cave"
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.5.0"
 DATA_FILE_NAME = "echo_cave_data.json"
 MEDIA_DIR_NAME = "echo_cave_media"
 LIST_LIMIT = 20
@@ -40,6 +40,7 @@ class EchoCavePlugin(Star):
         self._data_path = Path(__file__).resolve().parent / DATA_FILE_NAME
         self._media_dir = self._data_path.parent / MEDIA_DIR_NAME
         self._lock = asyncio.Lock()
+        self._cooldowns: dict[str, float] = {}
 
     async def initialize(self):
         """插件初始化时确保数据文件存在。"""
@@ -80,6 +81,11 @@ class EchoCavePlugin(Star):
         event.stop_event()
 
     async def _submit_command_flow(self, event: AstrMessageEvent, strip_command: bool):
+        cooldown_error = self._check_cooldown(event)
+        if cooldown_error is not None:
+            yield cooldown_error
+            event.stop_event()
+            return
         try:
             submission = await self._parse_submission(event, strip_command=strip_command)
             if submission is not None:
@@ -135,9 +141,53 @@ class EchoCavePlugin(Star):
             "未知参数。使用 `.cave -h` 查看帮助。"
         )
 
+    def _get_group_id(self, event: AstrMessageEvent) -> str:
+        """获取当前群/频道 ID，用于群隔离模式。"""
+        # 尝试 AstrBot 标准 getter
+        for getter_name in ("get_group_id", "get_channel_id", "get_session_id"):
+            value = self._call_event_getter(event, getter_name)
+            if value:
+                return str(value)
+        # 兜底：从 raw message 中查找
+        for mapping in self._raw_event_mappings(event):
+            for key in ("group_id", "channel_id", "guild_id", "session_id", "chat_id"):
+                value = mapping.get(key)
+                if value:
+                    return str(value)
+        # 私聊或无群上下文
+        return "_global_"
+
+    def _is_isolated(self) -> bool:
+        """是否开启了群隔离模式。"""
+        return bool(self.config.get("isolated_mode", False))
+
+    def _check_cooldown(self, event: AstrMessageEvent) -> Any | None:
+        """检查投稿冷却，返回 None 表示通过，否则返回错误消息。"""
+        cooldown = self.config.get("cooldown_seconds", 0)
+        if not cooldown or int(cooldown) <= 0:
+            return None
+
+        cooldown = int(cooldown)
+        sender_id = self._normalize_sender_id(self._call_event_getter(event, "get_sender_id"))
+        platform_name = self._get_platform_name(event)
+        key = f"{platform_name}:{sender_id}"
+
+        now = asyncio.get_event_loop().time() if hasattr(asyncio, "get_event_loop") else __import__("time").time()
+        import time as _time
+        last_time = self._cooldowns.get(key, 0)
+        elapsed = _time.time() - last_time
+
+        if elapsed < cooldown:
+            remaining = int(cooldown - elapsed)
+            return event.plain_result(f"投稿太快啦！请等待 {remaining} 秒后再试。")
+
+        self._cooldowns[key] = _time.time()
+        return None
+
     async def _create_random_echo_result(self, event: AstrMessageEvent):
         try:
-            entry = await self._pick_random_entry()
+            group_id = self._get_group_id(event)
+            entry = await self._pick_random_entry(group_id=group_id)
             if entry is None:
                 return event.plain_result("回声洞里还没有任何投稿。")
 
@@ -179,7 +229,8 @@ class EchoCavePlugin(Star):
             return admin_error
 
         try:
-            entries = await self._get_recent_entries(LIST_LIMIT)
+            group_id = self._get_group_id(event)
+            entries = await self._get_recent_entries(LIST_LIMIT, group_id=group_id)
             if not entries:
                 return event.plain_result("回声洞里还没有任何投稿。")
 
@@ -206,7 +257,8 @@ class EchoCavePlugin(Star):
             return event.plain_result("当前无法识别你的投稿身份，请稍后再试。")
 
         try:
-            entries = await self._get_entries_by_submitter(lookup_key, LIST_LIMIT)
+            group_id = self._get_group_id(event)
+            entries = await self._get_entries_by_submitter(lookup_key, LIST_LIMIT, group_id=group_id)
             if not entries:
                 return event.plain_result("你当前还没有投稿到回声洞。")
 
@@ -253,7 +305,8 @@ class EchoCavePlugin(Star):
             return event.plain_result("编号必须是正整数。")
 
         try:
-            deleted = await self._delete_entry(int(normalized_entry_id))
+            group_id = self._get_group_id(event)
+            deleted = await self._delete_entry(int(normalized_entry_id), group_id=group_id)
             if deleted is None:
                 return event.plain_result(f"未找到编号 #{normalized_entry_id} 的投稿。")
 
@@ -271,7 +324,8 @@ class EchoCavePlugin(Star):
             return event.plain_result("编号必须是正整数。")
 
         try:
-            entry = await self._get_entry_by_id(int(normalized_entry_id))
+            group_id = self._get_group_id(event)
+            entry = await self._get_entry_by_id(int(normalized_entry_id), group_id=group_id)
             if entry is None:
                 return event.plain_result(f"未找到编号 #{normalized_entry_id} 的回声。")
 
@@ -315,6 +369,12 @@ class EchoCavePlugin(Star):
                     controller.stop()
                     return
 
+                cooldown_error = self._check_cooldown(follow_event)
+                if cooldown_error is not None:
+                    await follow_event.send(cooldown_error)
+                    controller.stop()
+                    return
+
                 submission = await self._parse_submission(follow_event, strip_command=False)
                 if submission is None:
                     await follow_event.send(
@@ -337,7 +397,8 @@ class EchoCavePlugin(Star):
 
     async def _save_submission_result(self, event: AstrMessageEvent, submission: dict[str, Any]):
         persisted_submission = await self._materialize_submission_media(submission)
-        entry_id = await self._append_entry(persisted_submission)
+        group_id = self._get_group_id(event)
+        entry_id = await self._append_entry(persisted_submission, group_id=group_id)
         return event.plain_result(f"投稿已收录，编号 #{entry_id}。")
 
     def _parse_cave_cli(self, event: AstrMessageEvent) -> dict[str, str]:
@@ -396,7 +457,7 @@ class EchoCavePlugin(Star):
                 return text
         return ""
 
-    async def _append_entry(self, submission: dict[str, Any]) -> int:
+    async def _append_entry(self, submission: dict[str, Any], group_id: str = "_global_") -> int:
         async with self._lock:
             store = self._read_store_unlocked()
             entry_id = int(store["next_id"])
@@ -408,16 +469,19 @@ class EchoCavePlugin(Star):
                 "quote": submission.get("quote"),
                 "created_at": submission["created_at"],
                 "submitter": submission["submitter"],
+                "group_id": group_id,
             }
             store["entries"].append(entry)
             store["next_id"] = entry_id + 1
             self._write_store_unlocked(store)
             return entry_id
 
-    async def _pick_random_entry(self) -> dict[str, Any] | None:
+    async def _pick_random_entry(self, group_id: str = "_global_") -> dict[str, Any] | None:
         async with self._lock:
             store = self._read_store_unlocked()
             entries = store.get("entries", [])
+            if self._is_isolated():
+                entries = [e for e in entries if e.get("group_id", "_global_") == group_id]
             if not entries:
                 return None
             return deepcopy(random.choice(entries))
@@ -687,10 +751,12 @@ class EchoCavePlugin(Star):
         self._data_path.parent.mkdir(parents=True, exist_ok=True)
         self._media_dir.mkdir(parents=True, exist_ok=True)
 
-    async def _get_recent_entries(self, limit: int) -> list[dict[str, Any]]:
+    async def _get_recent_entries(self, limit: int, group_id: str = "_global_") -> list[dict[str, Any]]:
         async with self._lock:
             store = self._read_store_unlocked()
             entries = list(store.get("entries", []))
+            if self._is_isolated():
+                entries = [e for e in entries if e.get("group_id", "_global_") == group_id]
             recent_entries = entries[-limit:]
             recent_entries.reverse()
             return deepcopy(recent_entries)
@@ -699,35 +765,43 @@ class EchoCavePlugin(Star):
         self,
         lookup_key: str,
         limit: int,
+        group_id: str = "_global_",
     ) -> list[dict[str, Any]]:
         async with self._lock:
             store = self._read_store_unlocked()
+            entries = store.get("entries", [])
             matched_entries = [
                 entry
-                for entry in store.get("entries", [])
+                for entry in entries
                 if self._extract_submitter_lookup_key(entry) == lookup_key
             ]
+            if self._is_isolated():
+                matched_entries = [e for e in matched_entries if e.get("group_id", "_global_") == group_id]
             matched_entries = matched_entries[-limit:]
             matched_entries.reverse()
             return deepcopy(matched_entries)
 
-    async def _get_entry_by_id(self, entry_id: int) -> dict[str, Any] | None:
+    async def _get_entry_by_id(self, entry_id: int, group_id: str = "_global_") -> dict[str, Any] | None:
         async with self._lock:
             store = self._read_store_unlocked()
             for entry in store.get("entries", []):
                 try:
                     if int(entry.get("id", -1)) == entry_id:
+                        if self._is_isolated() and entry.get("group_id", "_global_") != group_id:
+                            continue
                         return deepcopy(entry)
                 except (TypeError, ValueError):
                     continue
             return None
 
-    async def _delete_entry(self, entry_id: int) -> dict[str, Any] | None:
+    async def _delete_entry(self, entry_id: int, group_id: str = "_global_") -> dict[str, Any] | None:
         async with self._lock:
             store = self._read_store_unlocked()
             entries = store.get("entries", [])
             for index, entry in enumerate(entries):
                 if int(entry.get("id", -1)) == entry_id:
+                    if self._is_isolated() and entry.get("group_id", "_global_") != group_id:
+                        return None
                     deleted = entries.pop(index)
                     self._write_store_unlocked(store)
                     return deepcopy(deleted)
@@ -1189,7 +1263,7 @@ class EchoCavePlugin(Star):
     def _help_text(self) -> str:
         return "\n".join(
             [
-                "回声洞命令：",
+                "回声洞命令 v1.5：",
                 ".cave                随机听一条回声",
                 ".cave -a [内容]      投稿；不带内容则进入 60 秒投稿模式",
                 ".cave -g 编号        查看指定编号的回声",
@@ -1202,7 +1276,11 @@ class EchoCavePlugin(Star):
                 "回复别人的消息进行投稿时，会把那条消息一并收入回声洞。",
                 "投稿支持：纯文本、纯图片、图文混合。",
                 "回声会保存脱敏署名，并在 .cave 时显示昵称和脱敏 ID。",
-                "插件设置支持追加管理员账号列表。",
+                "",
+                "插件设置：",
+                "- 群隔离模式：开启后各群回声洞数据互相隔离",
+                "- 投稿冷却：设置两次投稿间的最短间隔（秒），0 为无限制",
+                "- 管理员账号列表：追加额外管理员",
                 "",
                 "兼容旧命令：.cavepost、.cavehelp、.cavelist、.cavedel、/回声洞、/听回声、/回声洞帮助、/回声洞列表、/删除回声 编号。",
             ]

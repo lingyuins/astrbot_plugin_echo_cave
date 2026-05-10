@@ -3,5 +3,17 @@
     "type": "text",
     "description": "回声洞额外管理员账号列表",
     "hint": "填写用户 ID，支持换行、空格、英文逗号或分号分隔。配置后的账号可使用 /回声洞列表 和 .cavedel。"
+  },
+  "isolated_mode": {
+    "type": "boolean",
+    "description": "开启群隔离模式",
+    "hint": "开启后，每个群/频道的回声洞数据互相隔离，不会看到其他群的投稿。关闭则为全局共享。",
+    "default": false
+  },
+  "cooldown_seconds": {
+    "type": "number",
+    "description": "投稿冷却时间（秒）",
+    "hint": "同一个用户两次投稿之间需要等待的秒数。设为 0 则无冷却限制。",
+    "default": 0
   }
 }
