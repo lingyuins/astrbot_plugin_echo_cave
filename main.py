@@ -170,7 +170,14 @@ class EchoCavePlugin(Star):
         cooldown = int(cooldown)
         sender_id = self._normalize_sender_id(self._call_event_getter(event, "get_sender_id"))
         platform_name = self._get_platform_name(event)
-        key = f"{platform_name}:{sender_id}"
+        import time as _time
+
+        # 全局模式：冷却仅按用户区分；隔离模式：冷却按「用户+群」区分
+        if self._is_isolated():
+            group_id = self._get_group_id(event)
+            key = f"{platform_name}:{sender_id}:{group_id}"
+        else:
+            key = f"{platform_name}:{sender_id}"
 
         now = asyncio.get_event_loop().time() if hasattr(asyncio, "get_event_loop") else __import__("time").time()
         import time as _time
